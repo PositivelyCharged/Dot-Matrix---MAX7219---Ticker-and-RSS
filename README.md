@@ -1,4 +1,5 @@
-Dot‑Matrix MAX7219 Ticker and RSS Display
+Dot‑Matrix MAX7219 Ticker and RSS 
+
 This project uses a Parola‑based MAX7219 8×8 LED matrix to display market‑related information. With the appropriate APIs, the display can show useful real‑time indicators such as FX movements, commodities, indices, crypto prices, and curated RSS headlines. The project integrates ForexRateAPI as the primary source for paid, legal, live FX updates.
 
 Data handling and architecture
