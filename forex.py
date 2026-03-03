@@ -34,10 +34,7 @@ RSS_FEEDS = {
     "BBCSport": "https://feeds.bbci.co.uk/sport/rss.xml",
 }
 
-FOREX_API_URL = "https://api.forexrateapi.com/v1/latest"
-FOREX_API_KEY = "** YOUR FOREXRATEAPI key HERE**"
-
-BLYNK_BASE = "https://**YOUR LEGACY BLYNK IP HERE**:9443/**YOUR LEGACY BLYNK API HERE**/get"
+BLYNK_BASE = "YOUR BLYNK LEGACY SERVER IP HERE:9443/YOUR BLYNK LEGACY API KEY HERE/get"
 BLYNK_ENDPOINTS = {
     "Temp": "/V0",
     "Humidity": "/V1",
@@ -46,11 +43,14 @@ BLYNK_ENDPOINTS = {
     "Forecast": "/V7",
 }
 
+FOREX_API_URL = "https://api.forexrateapi.com/v1/latest"
+FOREX_API_KEY = "YOUR FOREX RATE API KEY GOES HERE"
+
 CRYPTO_API_URL = "https://api.coindesk.com/v1/bpi/currentprice.json"
 CRYPTO_API_URL_CG = "https://api.coingecko.com/api/v3/simple/price" # Using CoinGecko for ETH
 BRENT_API_URL = "https://www.alphavantage.co/query" # IMPORTANT: Replace with your API key
 
-# All GBP FX keys we care about (will be filled from ForexRate)
+# All GBP FX keys we care about (will be filled from FloatRates)
 FX_CODES = [
     "USD","EUR","JPY","CHF","AUD","CAD","NZD",
     "SEK","DKK","NOK","PLN","CZK","HUF","RON","BGN","HRK","ISK",
@@ -60,8 +60,12 @@ FX_CODES = [
     "ZAR","TRY","RUB"
 ]
 
+# Define all currencies we need for calculations
+ALL_CURRENCIES = list(set(FX_CODES + ["GBP", "USD", "EUR"]))
+
 # ---------- CACHE ----------
 cache = {}
+fx_data = {"ts": 0, "rates": {}} # Raw data cache for FX
 
 def init_cache():
     global cache
@@ -71,8 +75,11 @@ def init_cache():
     keys += ["Temp","Humidity","Pressure","Battery","Forecast", "DJI", "SPX", "NDX", "FTSE", "N225", "NYSE", "DAX", "CAC", "HSI", "SSEC"]
     keys += ["Brent", "Gold", "Silver", "WTI", "NatGas", "Copper", "BTC", "ETH", "SOL", "XRP", "DOGE"]
     keys += ["F_US500", "F_USTECH", "F_US30"]
-    for code in FX_CODES:
-        keys.append("GBP" + code)
+    
+    # Add all possible FX pairs to the cache keys
+    all_fx_pairs = ["GBP"+c for c in FX_CODES] + ["USDEUR", "USDJPY", "EURGBP", "EURJPY"]
+    for code in all_fx_pairs:
+        keys.append(code)
 
     cache = {k: {"json": None, "ts": 0} for k in keys}
 
@@ -95,25 +102,10 @@ last_indices = 0
 last_futures = 0
 
 def fetch_commodities():
-    # 1. Brent Crude via Alpha Vantage (Daily)
-    try:
-        params = {"function": "BRENT", "interval": "daily", "apikey": "**YOUR ALPHA VANTAGE API HERE**"}
-        r = requests.get(BRENT_API_URL, params=params, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if "data" in data and len(data["data"]) > 0:
-                price_str = data["data"][0]["value"]
-                if price_str == ".": price_str = data["data"][1]["value"]
-                title = f"Brent: ${float(price_str):.2f}"
-                cache["Brent"]["json"] = '{"status":"ok","items":[{"title":"' + title + '"}]}'
-                cache["Brent"]["ts"] = time.time()
-                logging.info(f"[CACHE] Updated Brent: {title}")
-    except Exception as e:
-        logging.error(f"[CACHE] Error fetching Brent: {e}")
-
-    # 2. Gold & Silver via yfinance
-    # Symbols: GC=F (Gold), SI=F (Silver), CL=F (WTI), NG=F (NatGas), HG=F (Copper)
+    # Unified commodities via yfinance (including Brent)
+    # Symbols: BZ=F (Brent), GC=F (Gold), SI=F (Silver), CL=F (WTI), NG=F (NatGas), HG=F (Copper)
     comm_list = [
+        ("Brent", "BZ=F"),
         ("Gold", "GC=F"), 
         ("Silver", "SI=F"),
         ("WTI", "CL=F"),
@@ -124,16 +116,17 @@ def fetch_commodities():
         try:
             # Using yfinance for commodities as well for consistency
             ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="2d")
+            hist = ticker.history(period="5d")
             if not hist.empty:
                 price = hist["Close"].iloc[-1]
+                date_str = hist.index[-1].strftime("%d/%m")
                 change_str = ""
                 if len(hist) >= 2:
                     prev = hist["Close"].iloc[-2]
                     change = price - prev
                     change_str = f" ({change:+.2f})"
                 if price > 0:
-                    title = f"{name}: ${price:,.2f}{change_str}"
+                    title = f"{name}: ${price:,.2f}{change_str}    {date_str}"
                     cache[name]["json"] = '{"status":"ok","items":[{"title":"' + title + '"}]}'
                     cache[name]["ts"] = time.time()
                     logging.info(f"[CACHE] Updated {name}: {title}")
@@ -169,12 +162,14 @@ def fetch_rss_xml(name, url):
 
 
 def fetch_forex_rates():
+    # This function now only populates the raw fx_data cache
+    global fx_data
     try:
-        logging.info("Fetching FX rates from ForexRateAPI...")
-        symbols = ",".join(FX_CODES)
+        logging.info("Fetching raw FX rates from ForexRateAPI with base USD...")
+        symbols = ",".join(ALL_CURRENCIES)
         params = {
             "api_key": FOREX_API_KEY,
-            "base": "GBP",
+            "base": "USD", # Use USD as the universal base
             "currencies": symbols
         }
         r = requests.get(FOREX_API_URL, params=params, headers=HEADERS, timeout=10)
@@ -182,26 +177,15 @@ def fetch_forex_rates():
         data = r.json()
 
         if not data.get("success"):
-            logging.error(f"[CACHE] ForexRateAPI error: {data.get('error')}")
+            logging.error(f"[CACHE] ForexRateAPI error: {data.get('error', 'Unknown error')}")
             return
 
-        rates = data.get("rates", {})
-        now = time.time()
-
-        for code in FX_CODES:
-            key = "GBP" + code
-            if code in rates:
-                rate = rates[code]
-                title = f"GBP/{code} = {rate:.4f}"
-                j = '{"status":"ok","items":[{"title":"' + title + '"}]}'
-                cache[key]["json"] = j
-                cache[key]["ts"] = now
-                logging.info(f"[CACHE] Updated {key}: {title}")
-            else:
-                logging.warning(f"[CACHE] No rate for {code} in ForexRateAPI")
-
+        fx_data["rates"] = data.get("rates", {})
+        fx_data["rates"]["USD"] = 1.0  # Ensure USD base is present
+        fx_data["ts"] = time.time()
+        logging.info(f"Successfully updated raw FX data for {len(fx_data['rates'])} currencies.")
     except Exception as e:
-        logging.error(f"[CACHE] Error fetching FX rates: {e}")
+        logging.error(f"[CACHE] Error fetching raw FX rates: {e}")
 
 
 def fetch_blynk_value(name, endpoint):
@@ -215,7 +199,7 @@ def fetch_blynk_value(name, endpoint):
         val = str(data[0])
 
         if name == "Temp":
-            title = f"Temp: {val} Ã‚Â°C"
+            title = f"Temp: {val} °C"
         elif name == "Humidity":
             title = f"Humidity: {val} %"
         elif name == "Pressure":
@@ -290,15 +274,16 @@ def fetch_indices():
         for key, symbol in indices.items():
             ticker = yf.Ticker(symbol)
             # Get 2 days of history to calculate change if market is open/closed
-            hist = ticker.history(period="2d")
+            hist = ticker.history(period="5d")
             if not hist.empty:
                 price = hist["Close"].iloc[-1]
+                date_str = hist.index[-1].strftime("%d/%m")
                 change_str = ""
                 if len(hist) >= 2:
                     prev = hist["Close"].iloc[-2]
                     change = price - prev
                     change_str = f" ({change:+.2f})"
-                title = f"{names[key]}: {price:,.2f}{change_str}"
+                title = f"{names[key]}: {price:,.2f}{change_str}    {date_str}"
                 cache[key]["json"] = '{"status":"ok","items":[{"title":"' + title + '"}]}'
                 cache[key]["ts"] = time.time()
                 logging.info(f"[CACHE] Updated {key}: {title}")
@@ -320,15 +305,16 @@ def fetch_futures():
         
         for key, symbol in futures.items():
             ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="2d")
+            hist = ticker.history(period="5d")
             if not hist.empty:
                 price = hist["Close"].iloc[-1]
+                date_str = hist.index[-1].strftime("%d/%m")
                 change_str = ""
                 if len(hist) >= 2:
                     prev = hist["Close"].iloc[-2]
                     change = price - prev
                     change_str = f" ({change:+.2f})"
-                title = f"{names[key]}: {price:,.2f}{change_str}"
+                title = f"{names[key]}: {price:,.2f}{change_str}    {date_str}"
                 cache[key]["json"] = '{"status":"ok","items":[{"title":"' + title + '"}]}'
                 cache[key]["ts"] = time.time()
                 logging.info(f"[CACHE] Updated {key}: {title}")
@@ -381,27 +367,111 @@ def cache_worker():
 @app.route("/rss")
 def rss():
     cat = request.args.get("category", "BBC")
+    
+    # Allow dynamic FX pairs (length 6, upper case) even if not in cache initially
     if cat not in cache:
-        cat = "BBC"
+        if len(cat) == 6 and cat.isupper():
+            cache[cat] = {"json": None, "ts": 0}
+        else:
+            cat = "BBC"
 
-    if cache[cat]["json"] is None:
-        logging.info(f"[CACHE] First request for {cat}, fetching immediately...")
-        if cat in RSS_FEEDS:
-            fetch_rss_xml(cat, RSS_FEEDS[cat])
-        elif cat.startswith("GBP"):
+    # --- Check if cache is valid ---
+    is_fx_pair = len(cat) == 6 and cat.isupper()
+    if cache[cat]["json"] is not None and (time.time() - cache[cat]["ts"] < FX_INTERVAL):
+        # For FX, also check if the underlying raw data is fresh. If not, recalculate.
+        if not is_fx_pair or (fx_data["ts"] > 0 and cache[cat]["ts"] >= fx_data["ts"]):
+            return Response(cache[cat]["json"], mimetype="application/json")
+
+    # --- Cache is stale or needs generating ---
+    logging.info(f"[CACHE] Stale or no cache for {cat}, generating...")
+    
+    # Trigger immediate fetches for non-FX items if cache is empty or stale
+    if not is_fx_pair:
+        if cat in RSS_FEEDS: fetch_rss_xml(cat, RSS_FEEDS[cat])
+        elif cat in BLYNK_ENDPOINTS: fetch_blynk_value(cat, BLYNK_ENDPOINTS[cat])
+        elif cat in ["BTC", "ETH", "SOL", "XRP", "DOGE"]: fetch_crypto()
+        elif cat in ["DJI", "SPX", "NDX", "FTSE", "N225", "NYSE", "DAX", "CAC", "HSI", "SSEC"]: fetch_indices()
+        elif cat in ["Brent", "Gold", "Silver", "WTI", "NatGas", "Copper"]: fetch_commodities()
+        elif cat in ["F_US500", "F_USTECH", "F_US30"]: fetch_futures()
+
+    # Handle FX pair calculation
+    elif is_fx_pair:
+        # Ensure raw data is fresh
+        if time.time() - fx_data["ts"] > FX_INTERVAL:
             fetch_forex_rates()
-        elif cat in BLYNK_ENDPOINTS:
-            fetch_blynk_value(cat, BLYNK_ENDPOINTS[cat])
-        elif cat in ["BTC", "ETH", "SOL", "XRP", "DOGE"]:
-            fetch_crypto()
-        elif cat in ["DJI", "SPX", "NDX", "FTSE", "N225", "NYSE", "DAX", "CAC", "HSI", "SSEC"]:
-            fetch_indices()
-        elif cat in ["Brent", "Gold", "Silver", "WTI", "NatGas", "Copper"]:
-            fetch_commodities()
-        elif cat in ["F_US500", "F_USTECH", "F_US30"]:
-            fetch_futures()
 
-    return Response(cache[cat]["json"], mimetype="application/json")
+        if fx_data["rates"]:
+            try:
+                base_curr, target_curr = cat[0:3], cat[3:6]
+                rate_base_vs_usd = fx_data["rates"][base_curr]
+                rate_target_vs_usd = fx_data["rates"][target_curr]
+                final_rate = rate_target_vs_usd / rate_base_vs_usd
+                
+                title = f"{base_curr}/{target_curr} = {final_rate:.4f}"
+                j = '{"status":"ok","items":[{"title":"' + title + '"}]}'
+                cache[cat]["json"] = j
+                cache[cat]["ts"] = time.time()
+                logging.info(f"[CACHE] Calculated and cached {cat}: {title}")
+            except (KeyError, ZeroDivisionError) as e:
+                logging.error(f"[CACHE] Could not calculate FX pair {cat}: {e}")
+    
+    return Response(cache[cat].get("json") or '{"status":"error","items":[]}', mimetype="application/json")
+
+
+@app.route("/")
+def index():
+    """Serves a simple homepage with attribution."""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Info Cache Proxy</title>
+        <style>
+            body { 
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                line-height: 1.6;
+                background-color: #121212;
+                color: #e0e0e0;
+                margin: 0;
+                padding: 20px;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+            }
+            .container {
+                text-align: center;
+                background-color: #1e1e1e;
+                padding: 30px 40px;
+                border-radius: 12px;
+                box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+                max-width: 600px;
+            }
+            h1 { color: #bb86fc; margin-bottom: 15px; }
+            p { color: #cfcfcf; }
+            .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #333; }
+            a { color: #03dac6; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Info Cache Proxy</h1>
+            <p>This proxy service is active and caching data for the ticker display.</p>
+            <div class="footer">
+                Powered by <a href="https://forexrateapi.com/" title="Free Currency Rates API" target="_blank">ForexRateAPI.com</a>
+                <br><br>
+                <a href="https://forexrateapi.com/" title="Free Currency Rates API" target="_blank">
+                    <img src='https://forexrateapi.com/logo-dark.png' alt="Currency Rates API by ForexRateAPI.com" border="0" height="24">
+                </a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
 
 
 if __name__ == "__main__":
