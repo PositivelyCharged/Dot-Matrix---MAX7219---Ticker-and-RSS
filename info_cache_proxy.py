@@ -86,7 +86,7 @@ def init_cache():
 init_cache()
 
 RSS_INTERVAL = 300
-FX_INTERVAL = 300
+FX_INTERVAL = 86400 # oops! 300 seconds depleted my API quota - now 24 hours (24 * 60 * 60) change this for "paid" more frequent updates!
 WEATHER_INTERVAL = 600
 CRYPTO_INTERVAL = 60
 BRENT_INTERVAL = 300
@@ -479,3 +479,4 @@ if __name__ == "__main__":
     t.start()
     logging.info("[SERVER] Starting info caching proxy on port 5000...")
     app.run(host="0.0.0.0", port=5000)
+
